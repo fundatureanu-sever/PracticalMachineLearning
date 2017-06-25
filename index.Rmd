@@ -1,0 +1,108 @@
+---
+title: "Qualitative Activity Recognition in Weight Lifting"
+author: "Sever Fundatureanu"
+date: "June 25, 2017"
+output:
+  html_document: default
+  pdf_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Overview
+
+This report shows how machine learning is used to predict the quality of a human activity such as weight lifting. We are using Human Activity Recognition data available [here](http://groupware.les.inf.puc-rio.br/har) with 5 classes (sitting-down, standing-up, standing, walking, and sitting) collected on 8 hours of activities of 4 healthy subjects. We achieve an estimated 99.4% accuracy with a random-forest model trained with 5-fold cross-validation.
+
+## Exploratory Data Analysis
+
+We dowload the datasets and load into dataframes:
+```{r echo=TRUE, cache=TRUE}
+download.file("https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv", "training.csv")
+training <- read.csv("training.csv")
+download.file("https://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv", "testing.csv")
+testing <- read.csv("training.csv")
+
+dim(training)
+```
+We have 160 columns in total, so we need to check if all of them should be used as predictors. We check for columns with too many NA values:
+```{r echo=TRUE, cache=TRUE}
+colNAs <- colSums(is.na(training))
+nrows <- nrow(training)
+# remove columns with more than 95% NAs
+naCols <- names(colNAs[colNAs/nrows > 0.95])
+validFeatures <- training[,-(which(names(training) %in% naCols))]
+```
+Next, we check for columns with low variance, since those will not contribute to our model fit. We use the function *nearZeroVar* from the *caret* package.
+```{r echo=TRUE}
+require(caret, quietly = TRUE)
+nearZeroVariance <- nearZeroVar(validFeatures, saveMetrics = TRUE)
+nzVarianceColumns <- rownames(nearZeroVariance[nearZeroVariance$nzv==TRUE,])
+```
+We look at the remaining columns and notice a set of columns like user_name and timestamp, which are simply metadata for the experiment. These should not be used as predictors since they will be widely different if someone will try to reproduce the experiment. We also see that column X is dependant on the row index, so it's just a row identifier in the dataset, thus irrelevant for our purposes.
+
+```{r echo=FALSE, cache=FALSE, fig.align="center", fig.height=3}
+library(ggplot2)
+d <- data.frame(x = as.numeric(row.names(training)), y=training$X)
+g <- ggplot(d, aes(x=x, y=y)) + geom_line(size = 1, color='blue') 
+g + labs(x = "Row Index", y = "X column")
+```
+
+We union the NA columns with zero variance columns with the metadata columns and filter them out. We are left with a subset of 53 columns for downstream processing.
+
+```{r echo=TRUE}
+metadataCols <- c("X", "user_name", "num_window", "raw_timestamp_part_1", 
+              "raw_timestamp_part_2", "cvtd_timestamp")
+filterOutCols <- union(nzVarianceColumns, union(naCols, metadataCols))
+newTrain <- training[,-(which(names(training) %in% filterOutCols))]
+dim(newTrain)
+```
+
+## Choosing a Prediction Algorithm
+
+We are trying to solve a classification problem, so we first try a boosting algorithm with 5-fold cross validation, since it has a good reputation. We use *caret*'s built-in cross-validation via the *trainControl* object.
+```{r echo=TRUE, cache=TRUE, eval=FALSE}
+set.seed(1230)
+tControl <- trainControl(method="cv", number=5)
+gbmModel <- train(classe ~ ., data=newTrain, method="gbm", trControl=tControl, verbose<-FALSE)
+accuracyIndex <- as.integer(rownames(gbmModel$bestTune))
+gbmModel$results$Accuracy[accuracyIndex]
+```
+
+We get an accuracy of 96.26% for the best tune from the results. Although this is quite good, the probability of predicting all 20 test results correctly will be $0.9626^{20}=0.4669$. 46.7% is not enough, we need to do better.
+
+We next try a random forest algorithm, again with 5-fold cross validation to avoid overfitting the model. We parallelize the algorithm to improve performance.
+
+```{r echo=TRUE, cache=TRUE}
+require(parallel, quietly = TRUE)
+require(doParallel, quietly = TRUE)
+cluster <- makeCluster(detectCores() - 1)
+registerDoParallel(cluster)
+tControl <- trainControl(method="cv", number=5)
+rfModel <- train(classe ~ ., data=newTrain, method="rf", 
+                 trControl=tControl, allowParallel=TRUE)
+rfModel$results[rfModel$results$mtry==rfModel$bestTune$mtry,]
+rfModel$finalModel
+```
+
+We get an accuracy of 99.42% for the best tune with $mtry=2$. This leads to a probabilty of $0.9942^{20}=0.89$ to predict the test results correctly, which is good enough. The final model has 500 trees and an Out-of-bag (OOB) error rate of 0.41% which is generally a good approximation of the test error rate. For interpretation purposes, we also plot the top 10 variables according to *variable importance* to get a sense of the variables which contributed most in building the trees.
+```{r echo=TRUE, fig.align="center", fig.height=4}
+varImpPlot(rfModel$finalModel, n.var=10)
+```
+Just for visualization, we plot the first 2 against each other and also the next 2, colouring by the output "classe" and indeed we notice interesting patterns
+
+```{r echo=FALSE, fig.align="center"}
+require(gridExtra, quietly = TRUE)
+q1 <- qplot(newTrain$roll_belt, newTrain$yaw_belt, colour=newTrain$classe,  xlab="roll_belt", ylab="yaw_belt")
+q2 <-qplot(newTrain$magnet_belt_z, newTrain$magnet_belt_y, colour=newTrain$classe,  xlab="magnet_belt_z", ylab="magnet_belt_y")
+grid.arrange(q1, q2, ncol=2)
+```
+
+## Predicting Test Results
+
+We can now use the random-forest model to predict our test results:
+
+```{r echo=TRUE, eval=FALSE}
+finalPredictions <- predict(rfModel, testing)
+```
